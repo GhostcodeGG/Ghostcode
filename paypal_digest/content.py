@@ -7,13 +7,28 @@ from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from .config import Config
 from .models import Article
 
 LOGGER = logging.getLogger(__name__)
 
 
-def enrich_article_content(article: Article, timeout: int = 10) -> Article:
+@retry(
+    retry=retry_if_exception_type((requests.RequestException, requests.Timeout)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    reraise=True
+)
+def _fetch_article_html(url: str, timeout: int) -> requests.Response:
+    """Fetch article HTML with retry logic."""
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response
+
+
+def enrich_article_content(article: Article, config: Config) -> Article:
     """Attempt to populate the article's content by scraping the linked page.
 
     If scraping fails the original article is returned unchanged.
@@ -23,8 +38,7 @@ def enrich_article_content(article: Article, timeout: int = 10) -> Article:
         return article
 
     try:
-        response = requests.get(article.url, timeout=timeout)
-        response.raise_for_status()
+        response = _fetch_article_html(article.url, config.request_timeout)
     except requests.RequestException as exc:
         LOGGER.debug("Unable to fetch article body for %s: %s", article.url, exc)
         return article
@@ -34,16 +48,15 @@ def enrich_article_content(article: Article, timeout: int = 10) -> Article:
     if not paragraphs:
         return article
 
-    max_chars = 2000
     text = "\n\n".join(paragraphs)
-    if len(text) > max_chars:
-        text = text[:max_chars]
+    if len(text) > config.max_content_chars:
+        text = text[:config.max_content_chars]
     article.content = text
     return article
 
 
-def best_text(article: Article) -> Optional[str]:
+def best_text(article: Article, config: Config) -> Optional[str]:
     """Return the most suitable text for summarization."""
 
-    enriched = enrich_article_content(article)
+    enriched = enrich_article_content(article, config)
     return enriched.primary_text()

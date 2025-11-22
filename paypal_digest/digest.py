@@ -64,11 +64,11 @@ def build_digest(config: Config) -> DigestResult:
     processed_ids: List[str] = []
 
     for article in fresh_articles:
-        text = best_text(article)
+        text = best_text(article, config)
         if not text:
             LOGGER.debug("Skipping article with no text: %s", article.url)
             continue
-        summary = summarize_text(text)
+        summary = summarize_text(text, config)
         digest_items.append(
             DigestItem(
                 title=article.title,

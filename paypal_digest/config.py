@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -24,7 +24,13 @@ class Config:
     query: str = "PayPal OR PYPL"
     language: str = "en"
     max_articles: int = 30
-    digest_date: datetime = field(default_factory=datetime.utcnow)
+    digest_date: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    # Processing configuration
+    request_timeout: int = 10
+    max_content_chars: int = 2000
+    summary_sentence_count: int = 3
+    summary_fallback_words: int = 60
 
     @property
     def digest_path(self) -> Path:

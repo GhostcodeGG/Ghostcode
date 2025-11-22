@@ -11,11 +11,27 @@ import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 import feedparser
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .config import Config
 from .models import Article
 
 LOGGER = logging.getLogger(__name__)
+
+
+# Retry decorator for HTTP requests
+def retry_http_request():
+    """Decorator for retrying HTTP requests with exponential backoff."""
+    return retry(
+        retry=retry_if_exception_type((requests.RequestException, requests.Timeout)),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        before_sleep=lambda retry_state: LOGGER.debug(
+            "Retrying HTTP request (attempt %d) after error: %s",
+            retry_state.attempt_number,
+            retry_state.outcome.exception() if retry_state.outcome else None
+        )
+    )
 
 
 class NewsFetcher:
@@ -37,11 +53,9 @@ class NewsAPIFetcher(NewsFetcher):
 
     API_URL = "https://newsapi.org/v2/everything"
 
-    def fetch(self, config: Config) -> List[Article]:
-        if not config.newsapi_key:
-            LOGGER.warning("Skipping NewsAPI fetcher – NEWSAPI_KEY not configured.")
-            return []
-
+    @retry_http_request()
+    def _make_request(self, config: Config) -> requests.Response:
+        """Make HTTP request with retry logic."""
         params = {
             "q": config.query,
             "language": config.language,
@@ -49,11 +63,19 @@ class NewsAPIFetcher(NewsFetcher):
             "sortBy": "publishedAt",
         }
         headers = {"Authorization": config.newsapi_key}
+        response = requests.get(self.API_URL, params=params, headers=headers, timeout=config.request_timeout)
+        response.raise_for_status()
+        return response
+
+    def fetch(self, config: Config) -> List[Article]:
+        if not config.newsapi_key:
+            LOGGER.warning("Skipping NewsAPI fetcher – NEWSAPI_KEY not configured.")
+            return []
+
         try:
-            response = requests.get(self.API_URL, params=params, headers=headers, timeout=10)
-            response.raise_for_status()
+            response = self._make_request(config)
         except requests.RequestException as exc:
-            LOGGER.error("NewsAPI request failed: %s", exc)
+            LOGGER.error("NewsAPI request failed after retries: %s", exc)
             return []
 
         payload = response.json()
@@ -95,12 +117,18 @@ class GoogleNewsFetcher(NewsFetcher):
 
     RSS_URL = "https://news.google.com/rss/search?hl=en-US&gl=US&ceid=US:en&q=PayPal"
 
+    @retry_http_request()
+    def _make_request(self, config: Config) -> requests.Response:
+        """Make HTTP request with retry logic."""
+        response = requests.get(self.RSS_URL, timeout=config.request_timeout)
+        response.raise_for_status()
+        return response
+
     def fetch(self, config: Config) -> List[Article]:
         try:
-            response = requests.get(self.RSS_URL, timeout=10)
-            response.raise_for_status()
+            response = self._make_request(config)
         except requests.RequestException as exc:
-            LOGGER.error("Google News RSS request failed: %s", exc)
+            LOGGER.error("Google News RSS request failed after retries: %s", exc)
             return []
 
         feed = feedparser.parse(response.content)
@@ -134,12 +162,18 @@ class PYMNTSFetcher(NewsFetcher):
     name = "pymnts"
     SOURCE_URL = "https://www.pymnts.com/company/paypal/"
 
+    @retry_http_request()
+    def _make_request(self, config: Config) -> requests.Response:
+        """Make HTTP request with retry logic."""
+        response = requests.get(self.SOURCE_URL, timeout=config.request_timeout)
+        response.raise_for_status()
+        return response
+
     def fetch(self, config: Config) -> List[Article]:
         try:
-            response = requests.get(self.SOURCE_URL, timeout=10)
-            response.raise_for_status()
+            response = self._make_request(config)
         except requests.RequestException as exc:
-            LOGGER.error("PYMNTS request failed: %s", exc)
+            LOGGER.error("PYMNTS request failed after retries: %s", exc)
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -182,8 +216,11 @@ def collect_articles(config: Config, fetchers: Optional[Iterable[NewsFetcher]] =
     for fetcher in fetchers:
         try:
             items = fetcher.fetch(config)
-        except Exception as exc:  # pragma: no cover - guard clause
-            LOGGER.exception("Fetcher %s failed unexpectedly: %s", fetcher.name, exc)
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            LOGGER.error("Fetcher %s failed: %s", fetcher.name, exc)
+            continue
+        except Exception as exc:  # Catch truly unexpected errors
+            LOGGER.exception("Fetcher %s encountered unexpected error: %s", fetcher.name, exc)
             continue
         for article in items:
             if article.id in seen_ids:
